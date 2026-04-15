@@ -461,6 +461,68 @@ async def test_async_upsert(mock_pgvector):
 
 
 @pytest.mark.asyncio
+async def test_async_upsert_429_batch_false(mock_pgvector):
+    """Document current behavior when embeddings fail but upsert proceeds.
+
+    Important: PgVector._async_embed_documents(batch_docs) returns None and is expected to
+    mutate each Document in-place (doc.embedding/doc.usage).
+
+    When embedder.enable_batch is False, PgVector._async_embed_documents() does not raise
+    on embedding errors. It uses asyncio.gather(..., return_exceptions=True) and only logs
+    exceptions, so failures (including rate limits / 429s) leave doc.embedding as None.
+
+    _async_upsert() then builds records from the documents as-is, so the resulting DB
+    record is built with embedding=None (SQL NULL).
+
+    Note: The 429 re-raise + rollback behavior only exists in the batch-embedding code
+    path (enable_batch True with async_get_embeddings_batch_and_usage). This test covers
+    the non-batch path where errors are swallowed and NULL embeddings can be written.
+    """
+
+    docs = [
+        Document(id="doc_0", content="rate limited doc 0", name="d0"),
+        Document(id="doc_1", content="rate limited doc 1", name="d1"),
+    ]
+
+    class RateLimitedBatchEmbedder:
+        enable_batch = False
+
+    mock_pgvector.embedder = RateLimitedBatchEmbedder()
+
+    # Simulate per-document 429s in the non-batch embedding path.
+    # PgVector._async_embed_documents() uses asyncio.gather(..., return_exceptions=True)
+    # and will only log these exceptions (it will not raise).
+    async def _raise_429(*args, **kwargs):
+        raise Exception("Error code: 429")
+
+    sess = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = sess
+    mock_pgvector.Session.return_value = cm
+
+    with (
+        patch("agno.vectordb.pgvector.pgvector.postgresql.insert") as mock_insert,
+        patch("agno.knowledge.document.Document.async_embed", new=_raise_429),
+    ):
+        insert_stmt = MagicMock(name="insert_stmt")
+        after_values = MagicMock(name="after_values")
+        after_values.excluded = MagicMock(name="excluded")
+        upsert_stmt = object()
+
+        mock_insert.return_value = insert_stmt
+        insert_stmt.values.return_value = after_values
+        after_values.on_conflict_do_update.return_value = upsert_stmt
+
+        # Should NOT raise, and should proceed to write records with embedding=None.
+        await mock_pgvector._async_upsert(content_hash="h", documents=docs, filters=None, batch_size=100)
+
+        assert sess.execute.called
+        (values_arg,), _ = insert_stmt.values.call_args
+        batch_records = values_arg
+        assert any(r["embedding"] is None for r in batch_records)
+
+
+@pytest.mark.asyncio
 async def test_async_search(mock_pgvector):
     """Test async_search method."""
     expected_results = [Document(id="test", content="Test document")]
