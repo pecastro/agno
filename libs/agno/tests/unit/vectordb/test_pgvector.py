@@ -523,6 +523,47 @@ async def test_async_upsert_429_batch_false(mock_pgvector):
 
 
 @pytest.mark.asyncio
+async def test_async_upsert_429_batch_true(mock_pgvector):
+    """When batch embedding hits a 429, PgVector should raise and not write any records.
+
+    PgVector._async_embed_documents() treats rate-limit-like errors (including "429") as
+    fatal in the batch path and re-raises.
+
+    This test asserts:
+    - _async_upsert raises on 429
+    - no DB write is attempted (no insert.values / sess.execute / sess.commit)
+    """
+
+    docs = [
+        Document(id="doc_0", content="rate limited doc 0", name="d0"),
+        Document(id="doc_1", content="rate limited doc 1", name="d1"),
+    ]
+
+    class RateLimitedBatchEmbedder:
+        enable_batch = True
+
+        async def async_get_embeddings_batch_and_usage(self, texts):
+            raise Exception("Error code: 429")
+
+    mock_pgvector.embedder = RateLimitedBatchEmbedder()
+
+    sess = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = sess
+    mock_pgvector.Session.return_value = cm
+
+    with patch("agno.vectordb.pgvector.pgvector.postgresql.insert") as mock_insert:
+        with pytest.raises(Exception, match="429"):
+            await mock_pgvector._async_upsert(content_hash="h", documents=docs, filters=None, batch_size=100)
+
+        # No insert statement should be built and no DB write should occur.
+        assert not mock_insert.called
+        assert not sess.execute.called
+        assert not sess.commit.called
+        assert sess.rollback.called
+
+
+@pytest.mark.asyncio
 async def test_async_search(mock_pgvector):
     """Test async_search method."""
     expected_results = [Document(id="test", content="Test document")]
